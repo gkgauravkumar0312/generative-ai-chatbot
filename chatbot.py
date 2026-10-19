@@ -1,10 +1,11 @@
 """
 Chatbot service: talks to the Google Gemini API.
 
-This module does not know about Streamlit. It only:
-- reads configuration from environment variables
-- sends conversation history to the model
-- returns the assistant's reply or a user-friendly error
+This module:
+- Loads configuration from environment variables
+- Sends conversation history to Gemini
+- Returns the assistant's reply
+- Provides useful error messages without exposing the API key
 """
 
 import os
@@ -14,51 +15,56 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import errors
 
+
 _ENV_FILE = Path(__file__).resolve().parent / ".env"
-
-
-def _load_env() -> None:
-    """Load GEMINI_* values from the project .env file."""
-    load_dotenv(_ENV_FILE)
-
-    if not os.getenv("GEMINI_API_KEY", "").strip():
-        load_dotenv(_ENV_FILE, override=True)
 
 
 class ChatbotError(Exception):
     """Raised when the chatbot cannot produce a response."""
 
 
+def _load_env() -> None:
+    """Load Gemini configuration from the project .env file."""
+    load_dotenv(_ENV_FILE)
+
+    if not os.getenv("GEMINI_API_KEY", "").strip():
+        load_dotenv(_ENV_FILE, override=True)
+
+
 def _get_api_key() -> str:
-    """Return the Gemini API key or raise a configuration error."""
+    """Get the Gemini API key."""
     _load_env()
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
 
     if not api_key or api_key == "your_api_key_here":
         raise ChatbotError(
-            "Gemini API key is missing. Add GEMINI_API_KEY to your .env file."
+            "Gemini API key is missing. Add GEMINI_API_KEY "
+            "to Streamlit Secrets or your local .env file."
         )
 
     return api_key
 
 
 def get_model_name() -> str:
-    """Return the configured Gemini model name."""
+    """Return the configured Gemini model."""
     _load_env()
-    return os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+    return (
+        os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+        or "gemini-2.5-flash"
+    )
 
 
 def get_client():
-    """Create a Gemini client using the configured API key."""
+    """Create a Gemini API client."""
     return genai.Client(api_key=_get_api_key())
 
 
 def get_response(messages: list[dict], model: str | None = None) -> str:
     """
-    Send conversation history to Gemini and return the assistant reply.
+    Send conversation history to Gemini.
 
-    messages: list of {"role": "system"|"user"|"assistant", "content": "..."}
-    model: optional model override from the UI.
+    Expected messages:
+    [{"role": "system"|"user"|"assistant", "content": "..."}]
     """
     if not messages:
         raise ChatbotError("No conversation history was provided.")
@@ -66,7 +72,7 @@ def get_response(messages: list[dict], model: str | None = None) -> str:
     selected_model = (model or get_model_name()).strip()
 
     if not selected_model:
-        raise ChatbotError("No Gemini model is configured. Set GEMINI_MODEL in .env.")
+        raise ChatbotError("No Gemini model is configured.")
 
     system_parts = []
     conversation = []
@@ -76,21 +82,30 @@ def get_response(messages: list[dict], model: str | None = None) -> str:
         content = str(message.get("content", ""))
 
         if role == "system":
-            system_parts.append(content)
+            if content.strip():
+                system_parts.append(content)
+
         elif role == "user":
-            conversation.append({"role": "user", "parts": [{"text": content}]})
+            conversation.append({
+                "role": "user",
+                "parts": [{"text": content}],
+            })
+
         elif role == "assistant":
-            conversation.append({"role": "model", "parts": [{"text": content}]})
+            conversation.append({
+                "role": "model",
+                "parts": [{"text": content}],
+            })
 
     if not conversation or conversation[-1]["role"] != "user":
         raise ChatbotError("The latest message must be from the user.")
 
+    config = {}
+    if system_parts:
+        config["system_instruction"] = "\n\n".join(system_parts)
+
     try:
         client = get_client()
-
-        config = {}
-        if system_parts:
-            config["system_instruction"] = "\n\n".join(system_parts)
 
         response = client.models.generate_content(
             model=selected_model,
@@ -98,30 +113,50 @@ def get_response(messages: list[dict], model: str | None = None) -> str:
             config=config or None,
         )
 
-    except errors.APIError as exc:
-        status = getattr(exc, "code", None)
-
-        if status in (401, 403):
-            raise ChatbotError(
-                "The Gemini API key is invalid or does not have access. "
-                "Check GEMINI_API_KEY."
-            ) from None
-
-        if status == 429:
-            raise ChatbotError(
-                "The Gemini API rate limit was reached. Please wait and try again."
-            ) from None
-
-        raise ChatbotError(
-            "The Gemini service returned an error. Please try again."
-        ) from None
-
     except ChatbotError:
         raise
-    except Exception:
+
+    except errors.APIError as exc:
+        status = getattr(exc, "code", None)
+        details = str(exc)
+
+        # Avoid accidentally exposing credentials in an error message.
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        if api_key:
+            details = details.replace(api_key, "[REDACTED]")
+
+        if status in (401, 403):
+            message = (
+                "Gemini authentication or permission error. "
+                "Check your API key and API access."
+            )
+        elif status == 429:
+            message = (
+                "Gemini quota or rate limit error. "
+                "Check your Google AI Studio usage and limits."
+            )
+        elif status == 404:
+            message = (
+                f"Gemini model '{selected_model}' was not found "
+                "or is unavailable to this API key."
+            )
+        elif status == 400:
+            message = "Gemini rejected the request. Check the model and request configuration."
+        else:
+            message = f"Gemini API error (HTTP {status})."
+
+        # Diagnostic details help identify the cause.
+        # The API key itself is never intentionally displayed.
+        if details:
+            message += f"\nDetails: {details[:500]}"
+
+        raise ChatbotError(message) from None
+
+    except Exception as exc:
+        error_type = type(exc).__name__
         raise ChatbotError(
-            "Could not connect to Gemini or generate a response. "
-            "Check your internet connection and API configuration."
+            f"Unexpected error ({error_type}). "
+            "Check the app configuration and Streamlit logs."
         ) from None
 
     try:
@@ -131,10 +166,12 @@ def get_response(messages: list[dict], model: str | None = None) -> str:
 
     if not content or not content.strip():
         raise ChatbotError(
-            "Gemini returned an empty response. Please try again."
+            "Gemini returned no text. The response may have been blocked "
+            "or contained no text content."
         )
 
     return content.strip()
+    
 
 
 
