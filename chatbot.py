@@ -1,5 +1,5 @@
 """
-Chatbot service: talks to the OpenAI API.
+Chatbot service: talks to the Google Gemini API.
 
 This module does not know about Streamlit. It only:
 - reads configuration from environment variables
@@ -11,19 +11,17 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from openai import APIConnectionError, APIError, AuthenticationError, OpenAI, RateLimitError
+from google import genai
+from google.genai import errors
 
-# Always load .env from this project folder, not the process working directory.
-# Streamlit may keep this module imported, so we also reload before each request.
 _ENV_FILE = Path(__file__).resolve().parent / ".env"
 
 
 def _load_env() -> None:
-    """Load OPENAI_* values from the project .env file."""
+    """Load GEMINI_* values from the project .env file."""
     load_dotenv(_ENV_FILE)
-    # An empty OPENAI_API_KEY already in the OS environment would otherwise
-    # block python-dotenv (it does not override existing variables by default).
-    if not os.getenv("OPENAI_API_KEY", "").strip():
+
+    if not os.getenv("GEMINI_API_KEY", "").strip():
         load_dotenv(_ENV_FILE, override=True)
 
 
@@ -32,81 +30,111 @@ class ChatbotError(Exception):
 
 
 def _get_api_key() -> str:
-    """Return the OpenAI API key or raise a clear configuration error."""
+    """Return the Gemini API key or raise a configuration error."""
     _load_env()
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+
     if not api_key or api_key == "your_api_key_here":
         raise ChatbotError(
-            "OpenAI API key is missing. Add OPENAI_API_KEY to your .env file "
-            "and restart the app."
+            "Gemini API key is missing. Add GEMINI_API_KEY to your .env file."
         )
+
     return api_key
 
 
 def get_model_name() -> str:
-    """Return the configured model name, with a safe default."""
+    """Return the configured Gemini model name."""
     _load_env()
-    return os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+    return os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
 
 
-def get_client() -> OpenAI:
-    """Create an OpenAI client using the key from the environment."""
-    return OpenAI(api_key=_get_api_key())
+def get_client():
+    """Create a Gemini client using the configured API key."""
+    return genai.Client(api_key=_get_api_key())
 
 
 def get_response(messages: list[dict], model: str | None = None) -> str:
     """
-    Send conversation history to the LLM and return the assistant reply.
+    Send conversation history to Gemini and return the assistant reply.
 
     messages: list of {"role": "system"|"user"|"assistant", "content": "..."}
-    model: optional model override from the UI; otherwise uses OPENAI_MODEL
+    model: optional model override from the UI.
     """
     if not messages:
         raise ChatbotError("No conversation history was provided.")
 
     selected_model = (model or get_model_name()).strip()
+
     if not selected_model:
-        raise ChatbotError("No OpenAI model is configured. Set OPENAI_MODEL in .env.")
+        raise ChatbotError("No Gemini model is configured. Set GEMINI_MODEL in .env.")
+
+    system_parts = []
+    conversation = []
+
+    for message in messages:
+        role = message.get("role")
+        content = str(message.get("content", ""))
+
+        if role == "system":
+            system_parts.append(content)
+        elif role == "user":
+            conversation.append({"role": "user", "parts": [{"text": content}]})
+        elif role == "assistant":
+            conversation.append({"role": "model", "parts": [{"text": content}]})
+
+    if not conversation or conversation[-1]["role"] != "user":
+        raise ChatbotError("The latest message must be from the user.")
 
     try:
         client = get_client()
-        completion = client.chat.completions.create(
+
+        config = {}
+        if system_parts:
+            config["system_instruction"] = "\n\n".join(system_parts)
+
+        response = client.models.generate_content(
             model=selected_model,
-            messages=messages,
+            contents=conversation,
+            config=config or None,
         )
-    except AuthenticationError:
+
+    except errors.APIError as exc:
+        status = getattr(exc, "code", None)
+
+        if status in (401, 403):
+            raise ChatbotError(
+                "The Gemini API key is invalid or does not have access. "
+                "Check GEMINI_API_KEY."
+            ) from None
+
+        if status == 429:
+            raise ChatbotError(
+                "The Gemini API rate limit was reached. Please wait and try again."
+            ) from None
+
         raise ChatbotError(
-            "The OpenAI API key is invalid. Check OPENAI_API_KEY in your .env file."
+            "The Gemini service returned an error. Please try again."
         ) from None
-    except RateLimitError:
-        raise ChatbotError(
-            "The OpenAI API rate limit was reached. Please wait a moment and try again."
-        ) from None
-    except APIConnectionError:
-        raise ChatbotError(
-            "Could not connect to OpenAI. Check your internet connection and try again."
-        ) from None
-    except APIError:
-        raise ChatbotError(
-            "The OpenAI service returned an error. Please try again in a moment."
-        ) from None
+
     except ChatbotError:
         raise
     except Exception:
         raise ChatbotError(
-            "Something went wrong while generating a response. Please try again."
+            "Could not connect to Gemini or generate a response. "
+            "Check your internet connection and API configuration."
         ) from None
 
     try:
-        content = completion.choices[0].message.content
-    except (AttributeError, IndexError, TypeError):
-        raise ChatbotError(
-            "Received an unexpected response from the model. Please try again."
-        ) from None
+        content = response.text
+    except (AttributeError, TypeError):
+        content = None
 
-    if not content or not str(content).strip():
+    if not content or not content.strip():
         raise ChatbotError(
-            "The model returned an empty response. Please try again."
+            "Gemini returned an empty response. Please try again."
         )
 
-    return str(content).strip()
+    return content.strip()
+
+
+
